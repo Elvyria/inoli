@@ -1,7 +1,8 @@
 [package]
-name = "heartbeat"
+name = "inoli"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0"
 
 [dependencies]
 chrono = "0.4.22"
@@ -9,10 +10,11 @@ crc = "3.0.0"
 futures = "0.3.24"
 spinoff = "0.5.3"
 uuid = "1.1.2"
+async-trait = "0.1.57"
 
-[dependencies.toio]
-version = 1.21.0
-features = ["full"]
+[dependencies.tokio]
+version = "1.21.0"
+features = [ "full" ]
 
 [dependencies.bluer]
 version = "0.15.0"

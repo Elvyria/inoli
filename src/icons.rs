@@ -1,9 +1,9 @@
-fn battery_icon(level: u32, max: u32) -> char {
+fn battery_icon(level: u8) -> char {
     match level {
-        _ => '',
+        90..101 => '',
+        65..90  => '',
+        35..65  => '',
+        5..35   => '',
+        0..5    => '',
     }
 }
-// 
-// 
-// 
-// 
