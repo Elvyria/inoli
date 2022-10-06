@@ -1,17 +1,21 @@
 use super::*;
+use super::alert::{uuid::ALERT_LEVEL, Alert, AlertLevel};
+use super::heartrate::HeartRate;
+use super::heartrate::uuid::{HEART_RATE_CONTROL_POINT, HEART_RATE_MEASUREMENT};
 
 use std::collections::HashMap;
 use std::convert::{TryInto, TryFrom};
-use std::fmt::{self, format};
+use std::fmt;
 use std::error::Error;
 use std::pin::Pin;
 
+use derive_more::Deref;
 use async_trait::async_trait;
 use bluer::gatt::remote::Characteristic;
 use bluer::{Device, Address};
-use chrono::{Datelike, Timelike, TimeZone, Utc, Duration};
+use chrono::{Datelike, Timelike, TimeZone, Utc};
 use crc::{Crc, CRC_8_MAXIM_DOW};
-use futures::{pin_mut, StreamExt, Stream, FutureExt};
+use futures::{StreamExt, Stream};
 
 pub const ADDRESS: Address = Address::new([0xC8, 0x0F, 0x10, 0x80, 0xD0, 0xAA]);
 
@@ -57,17 +61,8 @@ pub mod notifications {
 }
 
 mod command {
-    use std::ops::Deref;
-
+    #[derive(derive_more::Deref)]
     pub struct Command([u8; 1]);
-
-    impl Deref for Command {
-        type Target = [u8; 1];
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
-    }
 
     impl From<Command> for u8 {
         fn from(command: Command) -> Self {
@@ -87,7 +82,9 @@ pub enum OneS {}
 pub trait Model {}
 impl Model for OneS {}
 
+#[derive(Deref)]
 pub struct MiBand<M: Model> {
+    #[deref]
     pub device:      Device,
     user:            User,
     device_info:     Option<DeviceInfo>,
@@ -95,7 +92,7 @@ pub struct MiBand<M: Model> {
     characteristics: HashMap<::uuid::Uuid, Characteristic>,
 }
 
-impl MiBand<OneS> {
+impl<M: Model> MiBand<M> {
     pub fn new(device: Device, user: User) -> Self {
         Self {
             device,
@@ -107,12 +104,12 @@ impl MiBand<OneS> {
     }
 
     pub async fn connect(&mut self) -> Result<(), Box<dyn Error>> {
-        if !self.device.is_connected().await? {
+        if !self.is_connected().await? {
             self.device.connect().await?;
         }
 
         if self.characteristics.is_empty() {
-            for service in self.device.services().await? {
+            for service in self.services().await? {
                 let characteristics = service.characteristics().await?;
 
                 for c in characteristics.into_iter() {
@@ -247,14 +244,14 @@ impl MiBand<OneS> {
                  }))
     }
 
-    async fn le_params(&self) -> Result<LEParams, Box<dyn Error>> {
+    pub async fn le_params(&self) -> Result<LEParams, Box<dyn Error>> {
         let characteristic = &self.characteristics[&uuid::LE_PARAMS];
         let payload = characteristic.read().await?;
 
         LEParams::try_from(payload.as_slice()).map_err(Box::from)
     }
 
-    async fn set_le_params(&self, params: &LEParams) -> Result<(), bluer::Error> {
+    pub async fn set_le_params(&self, params: &LEParams) -> Result<(), bluer::Error> {
         let characteristic = &self.characteristics[&uuid::LE_PARAMS];
         characteristic.write_ext(&params.to_le_bytes(), WITH_RESPONSE).await
     }
@@ -284,69 +281,68 @@ impl MiBand<OneS> {
             let characteristic = &self.characteristics[&uuid::CONTROL];
             characteristic.write(&payload).await
         }
-
     */
 }
 
 #[async_trait]
 impl<M: Model> Alert for MiBand<M> where Self: Sync + Send {
-    async fn alert(&self, level: AlertLevel) -> Result<(), bluer::Error> {
-        let characteristic = &self.characteristics[&super::uuid::ALERT_LEVEL];
+    async fn alert(&self, level: AlertLevel) -> Result<(), Box<dyn Error>> {
+        let characteristic = &self.characteristics[&ALERT_LEVEL];
 
         let payload = match level {
             AlertLevel::Mild => [1],
             AlertLevel::High => [2],
         };
 
-        characteristic.write(&payload).await
+        characteristic
+            .write(&payload)
+            .await
+            .map_err(Box::from)
     }
 }
 
 #[async_trait]
-impl<M: Model> HeartRate for MiBand<M> where Self: Sync + Send {
-
-    async fn set_heartrate_continuous(&self, flag: bool) -> Result<(), bluer::Error> {
-        let characteristic = &self.characteristics[&super::uuid::HEART_RATE_CONTROL_POINT];
-
-        let mut payload = Self::CONTINUOUS;
-        payload[2] = flag as u8;
-
-        characteristic.write_ext(&payload, WITH_RESPONSE).await
-    }
-
-    async fn set_heartrate_sleep(&self, flag: bool) -> Result<(), bluer::Error> {
-        let characteristic = &self.characteristics[&super::uuid::HEART_RATE_CONTROL_POINT];
-
-        let mut payload = Self::SLEEP;
-        payload[2] = flag as u8;
-
-        characteristic.write_ext(&payload, WITH_RESPONSE).await
-    }
-
-    async fn notify_heartrate(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<u8>>>>, bluer::Error> {
-        let characteristic = &self.characteristics[&super::uuid::HEART_RATE_MEASUREMENT];
+impl HeartRate for MiBand<OneS> where Self: Sync + Send {
+    async fn notify_heartrate(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<u8>>>>, Box<dyn Error>> {
+        let characteristic = &self.characteristics[&HEART_RATE_MEASUREMENT];
         characteristic
             .notify()
             .await
             .map(|stream| Box::pin(stream) as _)
+            .map_err(Box::from)
     }
 
-    async fn measure_heartrate(&self) -> Result<HeartRateMeasure, Box<dyn Error>> {
-        let characteristic = &self.characteristics[&super::uuid::HEART_RATE_MEASUREMENT];
-        let notifications = characteristic.notify().await?;
-        pin_mut!(notifications);
+    async fn set_heartrate_sleep(&self, flag: bool) -> Result<(), Box<dyn Error>> {
+        let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
 
-        let characteristic = &self.characteristics[&super::uuid::HEART_RATE_CONTROL_POINT];
-        characteristic.write_ext(&Self::MANUAL, WITH_RESPONSE).await?;
+        let mut payload = Self::SLEEP;
+        payload[2] = flag as u8;
 
-        match notifications.next().await {
-            Some(v) if v.len() < 2 => todo!(),
-            Some(v) => Ok(HeartRateMeasure {
-                        samples: v[0],
-                        average: v[1],
-                    }),
-            None => todo!(),
-        }
+        characteristic
+            .write_ext(&payload, WITH_RESPONSE)
+            .await
+            .map_err(Box::from)
+    }
+
+    async fn heartrate_continuous(&self, flag: bool) -> Result<(), Box<dyn Error>> {
+        let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
+
+        let mut payload = Self::CONTINUOUS;
+        payload[2] = flag as u8;
+
+        characteristic
+            .write_ext(&payload, WITH_RESPONSE)
+            .await
+            .map_err(Box::from)
+    }
+
+    async fn heartrate(&self) -> Result<(), Box<dyn Error>> {
+        let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
+
+        characteristic
+            .write_ext(&Self::MANUAL, WITH_RESPONSE)
+            .await
+            .map_err(Box::from)
     }
 }
 
@@ -439,11 +435,12 @@ impl TryFrom<&[u8]> for DeviceInfo {
     }
 }
 
+#[derive(Deref)]
 pub struct Version([u8; 4]);
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}.{}.{}.{}", self.0[3], self.0[2], self.0[1], self.0[0])
+        write!(f, "{}.{}.{}.{}", self[3], self[2], self[1], self[0])
     }
 }
 
@@ -495,7 +492,7 @@ impl TryFrom<u8> for BatteryStatus {
     }
 }
 
-struct LEParams {
+pub struct LEParams {
     min_interval:           u16,
     max_interval:           u16,
     latency:                u16,

@@ -1,16 +1,18 @@
 mod hardware;
 mod devices;
+mod events;
 
 use std::error::Error;
-use std::time::Duration;
 
-use bluer::AdapterEvent;
-use chrono::{TimeZone, Utc, Local};
-use devices::miband::{User, MiBand, notifications};
-use devices::{Alert, HeartRate, WearLocation, Sex, alarm};
+use bluer::{AdapterEvent, Adapter, Device, Address};
+use chrono::Utc;
+use devices::miband::{User, MiBand, notifications, self};
+use devices::WearLocation;
 use futures::stream::StreamExt;
 use futures::pin_mut;
 use spinoff::{Spinner, Spinners};
+
+use devices::heartrate::HeartRate;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -19,18 +21,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
-    let mut discover = adapter.discover_devices().await?;
-
-    let device = loop {
-        if let Some(event) = discover.next().await {
-            if let AdapterEvent::DeviceAdded(address) = event {
-                if address == devices::miband::ADDRESS {
-                    break adapter.device(address);
-                }
-            }
-        }
-    }?;
-
+    let device = discover(&adapter, miband::ADDRESS).await?;
     let mut miband = MiBand::new(device, User::default());
     let spinner = Spinner::new(Spinners::Dots, format!("Connecting to {}...", miband.device.address()), None);
 
@@ -46,6 +37,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         match n.as_deref() {
             Some(notifications::AUTH_CONFIRMED) => break,
             Some(notifications::AUTH_SUCCESS) => break,
+            Some(notifications::AUTH_AWAITING) => {
+                // println!("Please confirm authentication with your device");
+            }
             Some(notifications::AUTH_FAILED) => {
                 miband.authenticate(true).await?;
             },
@@ -67,7 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut heartrate_stream = miband.notify_heartrate().await?;
 
     miband.set_heartrate_sleep(true).await?;
-    miband.set_heartrate_continuous(true).await?;
+    miband.heartrate_continuous(true).await?;
 
     let steps_stream = miband.notify_steps().await?;
     pin_mut!(steps_stream);
@@ -75,7 +69,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
         tokio::select! {
             Some(n) = notifications.next() => {
-                println!("  {:?}", n);
+                match n.as_slice() {
+                    miband::notifications::LE_PARAMS_SUCCESS => {},
+                    miband::notifications::ALARM => {},
+                    _ => {
+                        println!("  {:?}", n)
+                    }
+                }
             },
             Some(battery) = battery_stream.next() => {
                 println!("  {:?}", battery);
@@ -91,4 +91,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+async fn discover(adapter: &Adapter, lookup_address: Address) -> Result<Device, Box<dyn Error>> {
+    let mut discover = adapter.discover_devices().await?;
+
+    loop {
+        if let Some(event) = discover.next().await {
+            if let AdapterEvent::DeviceAdded(address) = event {
+                if address == lookup_address {
+                    return adapter.device(address).map_err(Box::from);
+                }
+            }
+        }
+    }
 }

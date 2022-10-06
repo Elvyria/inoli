@@ -19,3 +19,8 @@ features = [ "full" ]
 [dependencies.bluer]
 version = "0.15.0"
 features = [ "bluetoothd" ]
+
+[dependencies.derive_more]
+version = "0.99"
+default-features = false
+features = ["from", "deref"]

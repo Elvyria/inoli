@@ -1,9 +1,11 @@
-use std::{error::Error, ops::Deref, pin::Pin, fmt};
-use async_trait::async_trait;
+use std::{error::Error, fmt};
 use bluer::gatt::{remote::CharacteristicWriteRequest, WriteOp};
 use chrono::{Local, Utc};
-use futures::Stream;
+use derive_more::{Deref, From};
 
+pub mod generic;
+pub mod alert;
+pub mod heartrate;
 pub mod miband;
 
 pub mod uuid {
@@ -17,13 +19,6 @@ pub mod uuid {
 
     pub const GENERIC_ATTRIBUTE:        Uuid = uuid!("00001801-0000-1000-8000-00805f9b34fb");
     pub const SERVICE_CHANGED:          Uuid = uuid!("00002A05-0000-1000-8000-00805f9b34fb");
-
-    pub const ALERT:                    Uuid = uuid!("00001802-0000-1000-8000-00805f9b34fb");
-    pub const ALERT_LEVEL:              Uuid = uuid!("00002a06-0000-1000-8000-00805f9b34fb");
-
-    pub const HEART_RATE:               Uuid = uuid!("0000180D-0000-1000-8000-00805f9b34fb");
-    pub const HEART_RATE_MEASUREMENT:   Uuid = uuid!("00002A37-0000-1000-8000-00805f9b34fb");
-    pub const HEART_RATE_CONTROL_POINT: Uuid = uuid!("00002A39-0000-1000-8000-00805f9b34fb");
 }
 
 pub const WITH_RESPONSE: &'static CharacteristicWriteRequest = &CharacteristicWriteRequest {
@@ -33,33 +28,6 @@ pub const WITH_RESPONSE: &'static CharacteristicWriteRequest = &CharacteristicWr
     _non_exhaustive: (),
 };
 
-pub struct HeartRateMeasure {
-    pub samples: u8,
-    pub average: u8,
-}
-
-#[async_trait]
-pub trait HeartRate {
-    const MANUAL:     [u8; 3] = [0x15, 0x2, 0x1];
-    const CONTINUOUS: [u8; 3] = [0x15, 0x1, 0x0];
-    const SLEEP:      [u8; 3] = [0x15, 0x0, 0x0];
-
-    async fn set_heartrate_continuous(&self, flag: bool) -> Result<(), bluer::Error>;
-    async fn set_heartrate_sleep(&self, flag: bool) -> Result<(), bluer::Error>;
-    async fn measure_heartrate(&self) -> Result<HeartRateMeasure, Box<dyn Error>>;
-    async fn notify_heartrate(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<u8>>>>, bluer::Error>;
-}
-
-#[async_trait]
-pub trait Alert {
-    async fn alert(&self, level: AlertLevel) -> Result<(), bluer::Error>;
-}
-
-pub enum AlertLevel {
-    Mild,
-    High,
-}
-
 #[derive(Debug)]
 pub enum WearLocation {
     Left,
@@ -68,26 +36,12 @@ pub enum WearLocation {
     Pocket,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deref, From)]
 pub struct DateTime(chrono::DateTime<Utc>);
-
-impl From<chrono::DateTime<Utc>> for DateTime {
-    fn from(dt: chrono::DateTime<Utc>) -> Self {
-        Self(dt)
-    }
-}
 
 impl From<chrono::DateTime<Local>> for DateTime {
     fn from(dt: chrono::DateTime<Local>) -> Self {
         Self(dt.with_timezone(&chrono::Utc))
-    }
-}
-
-impl Deref for DateTime {
-    type Target = chrono::DateTime<Utc>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
