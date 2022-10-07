@@ -5,19 +5,19 @@ edition = "2021"
 license = "GPL-3.0"
 
 [dependencies]
-chrono = "0.4.22"
-crc = "3.0.0"
-futures = "0.3.24"
-spinoff = "0.5.3"
-uuid = "1.1.2"
-async-trait = "0.1.57"
+chrono = "0.4"
+crc = "3.0"
+futures = "0.3"
+spinoff = "0.5"
+uuid = "1.1"
+async-trait = "0.1"
 
 [dependencies.tokio]
-version = "1.21.0"
+version = "1.21"
 features = [ "full" ]
 
 [dependencies.bluer]
-version = "0.15.0"
+version = "0.15"
 features = [ "bluetoothd" ]
 
 [dependencies.derive_more]
