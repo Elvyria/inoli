@@ -1,4 +1,5 @@
 use super::*;
+use crate::Error;
 use super::alert::{uuid::ALERT_LEVEL, Alert, AlertLevel};
 use super::heartrate::HeartRate;
 use super::heartrate::uuid::{HEART_RATE_CONTROL_POINT, HEART_RATE_MEASUREMENT};
@@ -6,7 +7,6 @@ use super::heartrate::uuid::{HEART_RATE_CONTROL_POINT, HEART_RATE_MEASUREMENT};
 use std::collections::HashMap;
 use std::convert::{TryInto, TryFrom};
 use std::fmt;
-use std::error::Error;
 use std::pin::Pin;
 
 use derive_more::Deref;
@@ -30,7 +30,7 @@ mod uuid {
     pub const USER_INFO:                Uuid = uuid!("0000ff04-0000-1000-8000-00805f9b34fb");
     pub const CONTROL:                  Uuid = uuid!("0000ff05-0000-1000-8000-00805f9b34fb");
     pub const STEPS:                    Uuid = uuid!("0000ff06-0000-1000-8000-00805f9b34fb");
-    pub const CHARACTERISTIC_ACTIVITY:  Uuid = uuid!("0000ff07-0000-1000-8000-00805f9b34fb");
+    pub const ACTIVITY:                 Uuid = uuid!("0000ff07-0000-1000-8000-00805f9b34fb");
     pub const LE_PARAMS:                Uuid = uuid!("0000ff09-0000-1000-8000-00805f9b34fb");
     pub const DATE_TIME:                Uuid = uuid!("0000ff0a-0000-1000-8000-00805f9b34fb");
     pub const BATTERY_INFO:             Uuid = uuid!("0000ff0c-0000-1000-8000-00805f9b34fb");
@@ -50,14 +50,14 @@ mod uuid {
 }
 
 pub mod notifications {
-    pub const ALARM:             &'static [u8] = &[0x23];
-    pub const LE_PARAMS_SUCCESS: &'static [u8] = &[0x8];
+    pub const ALARM:             &[u8] = &[0x23];
+    pub const LE_PARAMS_SUCCESS: &[u8] = &[0x8];
 
-    pub const AUTH_AWAITING:     &'static [u8] = &[0x13];
-    pub const AUTH_CONFIRMED:    &'static [u8] = &[0x0a];
-    pub const AUTH_FAILED:       &'static [u8] = &[0x6];
-    pub const AUTH_SUCCESS:      &'static [u8] = &[0x5];
-    pub const AUTH_TIMEOUT:      &'static [u8] = &[0x9];
+    pub const AUTH_AWAITING:     &[u8] = &[0x13];
+    pub const AUTH_CONFIRMED:    &[u8] = &[0x0a];
+    pub const AUTH_FAILED:       &[u8] = &[0x6];
+    pub const AUTH_SUCCESS:      &[u8] = &[0x5];
+    pub const AUTH_TIMEOUT:      &[u8] = &[0x9];
 }
 
 mod command {
@@ -71,6 +71,7 @@ mod command {
     }
 
     pub const ALARM:         Command = Command([0x4]);
+    pub const COLLECT_DATA:  Command = Command([0x6]);
     pub const FACTORY_RESET: Command = Command([0x9]);
     pub const SYNC:          Command = Command([0xB]);
     pub const REBOOT:        Command = Command([0xC]);
@@ -103,18 +104,20 @@ impl<M: Model> MiBand<M> {
         }
     }
 
-    pub async fn connect(&mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn connect(&mut self) -> Result<(), Error> {
         if !self.is_connected().await? {
             self.device.connect().await?;
         }
 
-        if self.characteristics.is_empty() {
-            for service in self.services().await? {
-                let characteristics = service.characteristics().await?;
+        if !self.characteristics.is_empty() {
+            self.characteristics = HashMap::new();
+        }
 
-                for c in characteristics.into_iter() {
-                    self.characteristics.insert(c.uuid().await?, c);
-                }
+        for service in self.services().await? {
+            let characteristics = service.characteristics().await?;
+
+            for c in characteristics.into_iter() {
+                self.characteristics.insert(c.uuid().await?, c);
             }
         }
 
@@ -123,7 +126,7 @@ impl<M: Model> MiBand<M> {
         Ok(())
     }
 
-    pub async fn set_wear_location(&self, location: WearLocation) -> Result<(), bluer::Error> {
+    pub async fn set_wear_location(&self, location: WearLocation) -> Result<(), Error> {
         let payload = [
             command::WEAR_LOCATION.into(),
             match location {
@@ -137,7 +140,7 @@ impl<M: Model> MiBand<M> {
         self.control(payload).await
     }
 
-    pub async fn set_alarm(&self, id: u8, dt: &DateTime, smart: bool, repeat: u8) -> Result<(), bluer::Error> {
+    pub async fn set_alarm(&self, id: u8, dt: &DateTime, smart: bool, repeat: u8) -> Result<(), Error> {
         let mut payload = [0; 11];
         payload[0] = command::ALARM.into();
         payload[1] = id;
@@ -149,41 +152,50 @@ impl<M: Model> MiBand<M> {
         self.control(payload).await
     }
 
-    pub async fn authenticate(&mut self, new: bool) -> Result<(), Box<dyn Error>> {
+    pub async fn authenticate(&mut self, new: bool) -> Result<(), Error> {
         self.device_info = Some(self.device_info().await?);
         self.set_user(new).await
     }
 
-    pub async fn notify_battery(&self) -> Result<impl Stream<Item = BatteryInfo>, bluer::Error> {
+    pub async fn notify_battery(&self) -> Result<impl Stream<Item = BatteryInfo>, Error> {
         let characteristic = &self.characteristics[&uuid::BATTERY_INFO];
 
         characteristic 
             .notify() // impl Stream<Item = Vec<u8>>
             .await
+            .map_err(|e| e.into())
             .map(|stream|
                  stream.filter_map(|payload| async move {
                      BatteryInfo::try_from(payload.as_slice()).ok()
                  }))
     }
 
-    pub async fn notify_characteristics(&self) -> Result<impl Stream<Item = Vec<u8>>, bluer::Error> {
-        let characteristic = &self.characteristics[&uuid::CHARACTERISTIC_ACTIVITY];
-        characteristic.notify().await
+    pub async fn notify_characteristics(&self) -> Result<impl Stream<Item = Vec<u8>>, Error> {
+        let characteristic = &self.characteristics[&uuid::ACTIVITY];
+
+        characteristic
+            .notify()
+            .await
+            .map_err(|e| e.into())
     }
 
-    pub async fn notify(&self) -> Result<impl Stream<Item = Vec<u8>>, bluer::Error> {
+    pub async fn notify(&self) -> Result<impl Stream<Item = Vec<u8>>, Error> {
         let characteristic = &self.characteristics[&uuid::NOTIFICATIONS];
-        characteristic.notify().await
+
+        characteristic
+            .notify()
+            .await
+            .map_err(|e| e.into())
     }
 
-    async fn device_info(&self) -> Result<DeviceInfo, Box<dyn Error>> {
+    pub async fn device_info(&self) -> Result<DeviceInfo, Error> {
         let characteristic = &self.characteristics[&uuid::DEVICE_INFO];
         let payload = characteristic.read().await?;
 
-        DeviceInfo::try_from(payload.as_slice()).map_err(Box::from)
+        DeviceInfo::try_from(payload.as_slice())
     }
 
-    async fn set_user(&self, auth: bool) -> Result<(), Box<dyn Error>> {
+    async fn set_user(&self, auth: bool) -> Result<(), Error> {
         let device_info = match &self.device_info {
             Some(device_info) => device_info,
             None => panic!("Couldn't find device info")
@@ -202,39 +214,43 @@ impl<M: Model> MiBand<M> {
         Ok(())
     }
 
-    pub async fn set_datetime(&self, dt: &DateTime) -> Result<(), bluer::Error> {
+    pub async fn set_datetime(&self, dt: &DateTime) -> Result<(), Error> {
         let characteristic = &self.characteristics[&uuid::DATE_TIME];
 
         let mut payload = [0xFF; 12];
         payload[0..6].copy_from_slice(&<[u8; 6]>::from(dt));
 
-        characteristic.write(&payload).await
+        characteristic
+            .write(&payload)
+            .await
+            .map_err(|e| e.into())
     }
 
-    pub async fn battery(&self) -> Result<BatteryInfo, Box<dyn Error>> {
+    pub async fn battery(&self) -> Result<BatteryInfo, Error> {
         let characteristic = &self.characteristics[&uuid::BATTERY_INFO];
 
         let payload = characteristic.read().await?;
 
-        BatteryInfo::try_from(payload.as_slice()).map_err(Box::from)
+        BatteryInfo::try_from(payload.as_slice())
     }
 
-    pub async fn steps(&self) -> Result<u32, Box<dyn Error>> {
+    pub async fn steps(&self) -> Result<u32, Error> {
         let characteristic = &self.characteristics[&uuid::STEPS];
         let payload = characteristic.read().await?;
 
         payload.
             try_into()
             .map(u32::from_le_bytes)
-            .map_err(|_| ParseErr.into())
+            .map_err(|v| Error::Length { expected: 4, actual: v.len() })
     }
 
-    pub async fn notify_steps(&self) -> Result<impl Stream<Item = u32>, bluer::Error> {
+    pub async fn notify_steps(&self) -> Result<impl Stream<Item = u32>, Error> {
         let characteristic = &self.characteristics[&uuid::STEPS];
 
         characteristic 
             .notify() // impl Stream<Item = Vec<u8>>
             .await
+            .map_err(|e| e.into())
             .map(|stream|
                  stream.filter_map(|payload| async {
                      payload
@@ -244,36 +260,42 @@ impl<M: Model> MiBand<M> {
                  }))
     }
 
-    pub async fn le_params(&self) -> Result<LEParams, Box<dyn Error>> {
+    pub async fn le_params(&self) -> Result<LEParams, Error> {
         let characteristic = &self.characteristics[&uuid::LE_PARAMS];
         let payload = characteristic.read().await?;
 
-        LEParams::try_from(payload.as_slice()).map_err(Box::from)
+        LEParams::try_from(payload.as_slice())
     }
 
-    pub async fn set_le_params(&self, params: &LEParams) -> Result<(), bluer::Error> {
+    pub async fn set_le_params(&self, params: &LEParams) -> Result<(), Error> {
         let characteristic = &self.characteristics[&uuid::LE_PARAMS];
-        characteristic.write_ext(&params.to_le_bytes(), WITH_RESPONSE).await
+        characteristic
+            .write_ext(&params.to_le_bytes(), WITH_RESPONSE)
+            .await
+            .map_err(|e| e.into())
     }
 
-    pub async fn factory_reset(&self) -> Result<(), bluer::Error> {
+    pub async fn factory_reset(&self) -> Result<(), Error> {
         self.control(*command::FACTORY_RESET).await
     }
 
-    pub async fn reboot(&self) -> Result<(), bluer::Error> {
+    pub async fn reboot(&self) -> Result<(), Error> {
         self.control(*command::REBOOT).await
     }
 
-    async fn control<const N: usize>(&self, payload: [u8; N]) -> Result<(), bluer::Error> {
+    async fn control<const N: usize>(&self, payload: [u8; N]) -> Result<(), Error> {
         let characteristic = &self.characteristics[&uuid::CONTROL];
-        characteristic.write(&payload).await
+        characteristic
+            .write(&payload)
+            .await
+            .map_err(|e| e.into())
     }
 
     /*  Nightly Only 
         https://github.com/rust-lang/rust/issues/76560
         
         #![feature(generic_const_exprs)]
-        async fn control<const N: usize>(&self, command: command::Command, data: [u8; N]) -> Result<(), bluer::Error> {
+        async fn control<const N: usize>(&self, command: command::Command, data: [u8; N]) -> Result<(), Error> {
             let payload = [u8; N + 1];
             payload[0] = command.into()
             payload[1..].copy_from_slice(&data)
@@ -286,7 +308,7 @@ impl<M: Model> MiBand<M> {
 
 #[async_trait]
 impl<M: Model> Alert for MiBand<M> where Self: Sync + Send {
-    async fn alert(&self, level: AlertLevel) -> Result<(), Box<dyn Error>> {
+    async fn alert(&self, level: AlertLevel) -> Result<(), Error> {
         let characteristic = &self.characteristics[&ALERT_LEVEL];
 
         let payload = match level {
@@ -297,22 +319,22 @@ impl<M: Model> Alert for MiBand<M> where Self: Sync + Send {
         characteristic
             .write(&payload)
             .await
-            .map_err(Box::from)
+            .map_err(|e| e.into())
     }
 }
 
 #[async_trait]
 impl HeartRate for MiBand<OneS> where Self: Sync + Send {
-    async fn notify_heartrate(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<u8>>>>, Box<dyn Error>> {
+    async fn notify_heartrate(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<u8>>>>, Error> {
         let characteristic = &self.characteristics[&HEART_RATE_MEASUREMENT];
         characteristic
             .notify()
             .await
             .map(|stream| Box::pin(stream) as _)
-            .map_err(Box::from)
+            .map_err(|e| e.into())
     }
 
-    async fn set_heartrate_sleep(&self, flag: bool) -> Result<(), Box<dyn Error>> {
+    async fn set_heartrate_sleep(&self, flag: bool) -> Result<(), Error> {
         let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
 
         let mut payload = Self::SLEEP;
@@ -321,10 +343,10 @@ impl HeartRate for MiBand<OneS> where Self: Sync + Send {
         characteristic
             .write_ext(&payload, WITH_RESPONSE)
             .await
-            .map_err(Box::from)
+            .map_err(|e| e.into())
     }
 
-    async fn heartrate_continuous(&self, flag: bool) -> Result<(), Box<dyn Error>> {
+    async fn heartrate_continuous(&self, flag: bool) -> Result<(), Error> {
         let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
 
         let mut payload = Self::CONTINUOUS;
@@ -333,16 +355,16 @@ impl HeartRate for MiBand<OneS> where Self: Sync + Send {
         characteristic
             .write_ext(&payload, WITH_RESPONSE)
             .await
-            .map_err(Box::from)
+            .map_err(|e| e.into())
     }
 
-    async fn heartrate(&self) -> Result<(), Box<dyn Error>> {
+    async fn heartrate(&self) -> Result<(), Error> {
         let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
 
         characteristic
             .write_ext(&Self::MANUAL, WITH_RESPONSE)
             .await
-            .map_err(Box::from)
+            .map_err(|e| e.into())
     }
 }
 
@@ -386,13 +408,13 @@ impl User {
 }
 
 impl TryFrom<u8> for Sex {
-    type Error = ParseErr;
+    type Error = Error;
 
     fn try_from(b: u8) -> Result<Self, Self::Error> {
         match b {
             0 => Ok(Sex::Female),
             1 => Ok(Sex::Male),
-            _ => Err(ParseErr)
+            _ => Err(Error::Parse { expected: "0,1", position: 0, actual: b })
         }
     }
 }
@@ -417,7 +439,7 @@ pub struct DeviceInfo {
 }
 
 impl TryFrom<&[u8]> for DeviceInfo {
-    type Error = ParseErr;
+    type Error = Error;
 
     fn try_from(b: &[u8]) -> Result<Self, Self::Error> {
         if b.len() == 20 {
@@ -431,12 +453,9 @@ impl TryFrom<&[u8]> for DeviceInfo {
                 firmware_version_heart: Version(b[16..20].try_into().unwrap()),
             })
         }
-        else { Err(ParseErr) }
+        else { Err(Error::Length { expected: 20, actual: b.len() }) }
     }
 }
-
-#[derive(Deref)]
-pub struct Version([u8; 4]);
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -453,7 +472,7 @@ pub struct BatteryInfo {
 }
 
 impl TryFrom<&[u8]> for BatteryInfo {
-    type Error = ParseErr;
+    type Error = Error;
 
     fn try_from(b: &[u8]) -> Result<Self, Self::Error> {
         if b.len() == 10 {
@@ -465,7 +484,7 @@ impl TryFrom<&[u8]> for BatteryInfo {
                 status:   BatteryStatus::try_from(b[9])?,
             })
         } else {
-            Err(ParseErr)
+            Err(Error::Length { expected: 10, actual: b.len() })
         }
     }
 }
@@ -479,7 +498,7 @@ pub enum BatteryStatus {
 }
 
 impl TryFrom<u8> for BatteryStatus {
-    type Error = ParseErr;
+    type Error = Error;
 
     fn try_from(b: u8) -> Result<Self, Self::Error> {
         match b {
@@ -487,7 +506,7 @@ impl TryFrom<u8> for BatteryStatus {
             2 => Ok(BatteryStatus::Charging),
             3 => Ok(BatteryStatus::NotCharging),
             4 => Ok(BatteryStatus::Full),
-            _ => Err(ParseErr)
+            _ => Err(Error::Parse { expected: "1,2,3,4", position: 0, actual: b })
         }
     }
 }
@@ -538,7 +557,7 @@ impl LEParams {
 }
 
 impl TryFrom<&[u8]> for LEParams {
-    type Error = ParseErr;
+    type Error = Error;
 
     fn try_from(b: &[u8]) -> Result<Self, Self::Error> {
         if b.len() == 12 {
@@ -551,28 +570,8 @@ impl TryFrom<&[u8]> for LEParams {
                 advertisement_interval: u16::from_le_bytes(b[10..12].try_into().unwrap()),
             })
         } else {
-            Err(ParseErr)
+            Err(Error::Length { expected: 12, actual: b.len() })
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CharacteristicError(::uuid::Uuid);
-
-impl Error for CharacteristicError {}
-impl fmt::Display for CharacteristicError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "couldn't find characteristic with uuid {}", self.0)
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct ParseErr;
-
-impl <'a>Error for ParseErr {}
-impl <'a>fmt::Display for ParseErr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "")
     }
 }
 

@@ -1,10 +1,10 @@
+use crate::Error;
+use super::generic::Capability;
+
 use std::pin::Pin;
-use std::error::Error;
 
 use async_trait::async_trait;
 use futures::Stream;
-
-use super::generic::{Generic, Capability};
 
 pub mod uuid {
     use uuid::{uuid, Uuid};
@@ -23,8 +23,8 @@ pub trait HeartRate {
     const CONTINUOUS: [u8; 3] = [0x15, 0x1, 0x0];
     const SLEEP:      [u8; 3] = [0x15, 0x0, 0x0];
 
-    async fn notify_heartrate(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<u8>>>>, Box<dyn Error>>;
-    async fn set_heartrate_sleep(&self, flag: bool) -> Result<(), Box<dyn Error>>;
-    async fn heartrate_continuous(&self, flag: bool) -> Result<(), Box<dyn Error>>;
-    async fn heartrate(&self) -> Result<(), Box<dyn Error>>;
+    async fn notify_heartrate(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<u8>>>>, Error>;
+    async fn set_heartrate_sleep(&self, flag: bool) -> Result<(), Error>;
+    async fn heartrate_continuous(&self, flag: bool) -> Result<(), Error>;
+    async fn heartrate(&self) -> Result<(), Error>;
 }

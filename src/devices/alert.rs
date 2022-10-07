@@ -1,7 +1,7 @@
-use std::error::Error;
+use crate::Error;
 use async_trait::async_trait;
 
-use super::generic::{Generic, Capability};
+use super::generic::Capability;
 
 pub mod uuid {
     use uuid::{uuid, Uuid};
@@ -15,7 +15,7 @@ impl Capability for AlertDevice {}
 
 #[async_trait]
 pub trait Alert {
-    async fn alert(&self, level: AlertLevel) -> Result<(), Box<dyn Error>>;
+    async fn alert(&self, level: AlertLevel) -> Result<(), Error>;
 }
 
 pub enum AlertLevel {

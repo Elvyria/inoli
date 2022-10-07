@@ -1,4 +1,3 @@
-use std::{error::Error, fmt};
 use bluer::gatt::{remote::CharacteristicWriteRequest, WriteOp};
 use chrono::{Local, Utc};
 use derive_more::{Deref, From};
@@ -21,12 +20,15 @@ pub mod uuid {
     pub const SERVICE_CHANGED:          Uuid = uuid!("00002A05-0000-1000-8000-00805f9b34fb");
 }
 
-pub const WITH_RESPONSE: &'static CharacteristicWriteRequest = &CharacteristicWriteRequest {
+pub const WITH_RESPONSE: &CharacteristicWriteRequest = &CharacteristicWriteRequest {
     offset: 0,
     op_type: WriteOp::Request,
     prepare_authorize: false,
     _non_exhaustive: (),
 };
+
+#[derive(Deref)]
+pub struct Version([u8; 4]);
 
 #[derive(Debug)]
 pub enum WearLocation {
@@ -64,15 +66,4 @@ pub mod alarm {
     pub const WORKWEEK:  u8 = 31;
     pub const WEEKENDS:  u8 = 96;
     pub const EVERYDAY:  u8 = 127;
-}
-
-
-#[derive(Debug, Copy, Clone)]
-pub struct NotSupportedErr;
-
-impl <'a>Error for NotSupportedErr {}
-impl <'a>fmt::Display for NotSupportedErr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Not supported")
-    }
 }
