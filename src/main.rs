@@ -10,7 +10,6 @@ use devices::miband::{User, MiBand, LEParams, notifications, self};
 use devices::WearLocation;
 use futures::stream::StreamExt;
 use futures::pin_mut;
-use spinoff::{Spinner, Spinners};
 
 use devices::heartrate::HeartRate;
 use tokio::time::Instant;
