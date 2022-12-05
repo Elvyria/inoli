@@ -26,6 +26,7 @@ mod uuid {
 
     pub const MI_SERVICES:              Uuid = uuid!("0000fee0-0000-1000-8000-00805f9b34fb");
     pub const DEVICE_INFO:              Uuid = uuid!("0000ff01-0000-1000-8000-00805f9b34fb");
+    pub const DEVICE_NAME:              Uuid = uuid!("0000ff02-0000-1000-8000-00805f9b34fb");
     pub const NOTIFICATIONS:            Uuid = uuid!("0000ff03-0000-1000-8000-00805f9b34fb");
     pub const USER_INFO:                Uuid = uuid!("0000ff04-0000-1000-8000-00805f9b34fb");
     pub const CONTROL:                  Uuid = uuid!("0000ff05-0000-1000-8000-00805f9b34fb");
@@ -71,11 +72,13 @@ mod command {
     }
 
     pub const ALARM:         Command = Command([0x4]);
+    pub const STEP_GOAL:     Command = Command([0x5]);
     pub const COLLECT_DATA:  Command = Command([0x6]);
     pub const FACTORY_RESET: Command = Command([0x9]);
     pub const SYNC:          Command = Command([0xB]);
     pub const REBOOT:        Command = Command([0xC]);
     pub const WEAR_LOCATION: Command = Command([0xF]);
+    pub const SET_STEPS:     Command = Command([0x14]);
 }
 
 pub enum OneS {}
@@ -102,6 +105,13 @@ impl<M: Model> MiBand<M> {
             model:           std::marker::PhantomData,
             characteristics: HashMap::new(),
         }
+    }
+
+    pub async fn name(&self) -> Result<String, Error> {
+        let characteristic = &self.characteristics[&uuid::DEVICE_NAME];
+        let payload = characteristic.read().await?;
+
+        Ok(String::from_utf8_lossy(&payload[3..]).to_string())
     }
 
     pub async fn connect(&mut self) -> Result<(), Error> {
@@ -140,11 +150,11 @@ impl<M: Model> MiBand<M> {
         self.control(payload).await
     }
 
-    pub async fn set_alarm(&self, id: u8, dt: &DateTime, smart: bool, repeat: u8) -> Result<(), Error> {
+    pub async fn set_alarm(&self, id: u8, enabled: bool, dt: &DateTime, smart: bool, repeat: u8) -> Result<(), Error> {
         let mut payload = [0; 11];
         payload[0] = command::ALARM.into();
         payload[1] = id;
-        payload[2] = true as u8;
+        payload[2] = enabled as u8;
         payload[3..9].copy_from_slice(&<[u8; 6]>::from(dt));
         payload[9] = smart as u8;
         payload[10] = repeat;
@@ -221,7 +231,7 @@ impl<M: Model> MiBand<M> {
         payload[0..6].copy_from_slice(&<[u8; 6]>::from(dt));
 
         characteristic
-            .write(&payload)
+            .write_ext(&payload, WITH_RESPONSE)
             .await
             .map_err(|e| e.into())
     }
@@ -232,6 +242,14 @@ impl<M: Model> MiBand<M> {
         let payload = characteristic.read().await?;
 
         BatteryInfo::try_from(payload.as_slice())
+    }
+
+    pub async fn set_steps(&self, steps: u32) -> Result<(), Error> {
+        let mut payload = [0; 5];
+        payload[0] = command::SET_STEPS.into();
+        payload[1..5].copy_from_slice(&steps.to_le_bytes());
+
+        self.control(payload).await
     }
 
     pub async fn steps(&self) -> Result<u32, Error> {
@@ -286,7 +304,7 @@ impl<M: Model> MiBand<M> {
     async fn control<const N: usize>(&self, payload: [u8; N]) -> Result<(), Error> {
         let characteristic = &self.characteristics[&uuid::CONTROL];
         characteristic
-            .write(&payload)
+            .write_ext(&payload, WITH_RESPONSE)
             .await
             .map_err(|e| e.into())
     }
@@ -334,23 +352,27 @@ impl HeartRate for MiBand<OneS> where Self: Sync + Send {
             .map_err(|e| e.into())
     }
 
-    async fn set_heartrate_sleep(&self, flag: bool) -> Result<(), Error> {
+    async fn set_heartrate_sleep(&self, enable: bool) -> Result<(), Error> {
         let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
 
         let mut payload = Self::SLEEP;
-        payload[2] = flag as u8;
+        payload[2] = enable as u8;
 
         characteristic
             .write_ext(&payload, WITH_RESPONSE)
+            .await?;
+
+        characteristic // Unknown
+            .write_ext(&[0x14, 0x0], WITH_RESPONSE)
             .await
             .map_err(|e| e.into())
     }
 
-    async fn heartrate_continuous(&self, flag: bool) -> Result<(), Error> {
+    async fn heartrate_continuous(&self, enable: bool) -> Result<(), Error> {
         let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
 
         let mut payload = Self::CONTINUOUS;
-        payload[2] = flag as u8;
+        payload[2] = enable as u8;
 
         characteristic
             .write_ext(&payload, WITH_RESPONSE)

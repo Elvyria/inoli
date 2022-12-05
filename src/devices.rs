@@ -63,7 +63,7 @@ pub mod alarm {
     pub const SATURDAY:  u8 = 32;
     pub const SUNDAY:    u8 = 64;
 
-    pub const WORKWEEK:  u8 = 31;
-    pub const WEEKENDS:  u8 = 96;
-    pub const EVERYDAY:  u8 = 127;
+    pub const WORKWEEK:  u8 = MONDAY + TUESDAY + WEDNESDAY + THURSDAY + FRIDAY;
+    pub const WEEKENDS:  u8 = SATURDAY + SUNDAY;
+    pub const EVERYDAY:  u8 = WORKWEEK + WEEKENDS;
 }
