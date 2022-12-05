@@ -24,7 +24,7 @@ pub trait HeartRate {
     const SLEEP:      [u8; 3] = [0x15, 0x0, 0x0];
 
     async fn notify_heartrate(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<u8>>>>, Error>;
-    async fn set_heartrate_sleep(&self, flag: bool) -> Result<(), Error>;
-    async fn heartrate_continuous(&self, flag: bool) -> Result<(), Error>;
+    async fn set_heartrate_sleep(&self, enable: bool) -> Result<(), Error>;
+    async fn heartrate_continuous(&self, enable: bool) -> Result<(), Error>;
     async fn heartrate(&self) -> Result<(), Error>;
 }
