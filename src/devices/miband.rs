@@ -1,25 +1,29 @@
-use super::*;
-use crate::Error;
-use super::alert::{uuid::ALERT_LEVEL, Alert, AlertLevel};
-use super::heartrate::HeartRate;
-use super::heartrate::uuid::{HEART_RATE_CONTROL_POINT, HEART_RATE_MEASUREMENT};
+use super::bluetooth::{WITH_RESPONSE, BluetoothDevice};
+use super::capabilities::alarm::AlarmFrequency;
+use super::capabilities::alert::{AlertCapable, Alert};
+use super::capabilities::battery::{BatteryStatus, BatteryInfo, Battery};
+use super::capabilities::heartrate::{HeartRateCapable, HeartRate};
+use super::capabilities::steps::Steps;
+use super::{DateTime, Version, WearLocation};
+use crate::bio::{Bio, Sex};
+use crate::{Error, ensure_length};
 
 use std::collections::HashMap;
 use std::convert::{TryInto, TryFrom};
-use std::fmt;
 use std::pin::Pin;
+use std::{fmt, mem};
 
 use derive_more::Deref;
 use async_trait::async_trait;
 use bluer::gatt::remote::Characteristic;
 use bluer::{Device, Address};
-use chrono::{Datelike, Timelike, TimeZone, Utc};
+use chrono::{Datelike, Timelike, TimeZone, Utc, Local};
+
 use crc::{Crc, CRC_8_MAXIM_DOW};
-use futures::{StreamExt, Stream};
+use futures::{StreamExt, Stream, pin_mut};
+use log::debug;
 
 pub const ADDRESS: Address = Address::new([0xC8, 0x0F, 0x10, 0x80, 0xD0, 0xAA]);
-
-static CRC: Crc<u8> = Crc::<u8>::new(&CRC_8_MAXIM_DOW);
 
 mod uuid {
     use uuid::{uuid, Uuid};
@@ -38,15 +42,15 @@ mod uuid {
     pub const PAIR:                     Uuid = uuid!("0000ff0f-0000-1000-8000-00805f9b34fb");
     pub const MAC:                      Uuid = uuid!("0000fec9-0000-1000-8000-00805f9b34fb");
 
-    /*
-    pub const UNKNOWN:                  Uuid = uuid!("0000fee1-0000-1000-8000-00805f9b34fb");
-    pub const UNKNOWN:                  Uuid = uuid!("0000fedd-0000-1000-8000-00805f9b34fb");
-    pub const UNKNOWN:                  Uuid = uuid!("0000fede-0000-1000-8000-00805f9b34fb");
-    pub const UNKNOWN:                  Uuid = uuid!("0000fedf-0000-1000-8000-00805f9b34fb");
-    pub const UNKNOWN:                  Uuid = uuid!("0000fed0-0000-1000-8000-00805f9b34fb");
-    pub const UNKNOWN:                  Uuid = uuid!("0000fed1-0000-1000-8000-00805f9b34fb");
-    pub const UNKNOWN:                  Uuid = uuid!("0000fed2-0000-1000-8000-00805f9b34fb");
-    pub const UNKNOWN:                  Uuid = uuid!("0000fed3-0000-1000-8000-00805f9b34fb");
+    /* Unknown 
+        pub const UNKNOWN:              Uuid = uuid!("0000fee1-0000-1000-8000-00805f9b34fb");
+        pub const UNKNOWN:              Uuid = uuid!("0000fedd-0000-1000-8000-00805f9b34fb");
+        pub const UNKNOWN:              Uuid = uuid!("0000fede-0000-1000-8000-00805f9b34fb");
+        pub const UNKNOWN:              Uuid = uuid!("0000fedf-0000-1000-8000-00805f9b34fb");
+        pub const UNKNOWN:              Uuid = uuid!("0000fed0-0000-1000-8000-00805f9b34fb");
+        pub const UNKNOWN:              Uuid = uuid!("0000fed1-0000-1000-8000-00805f9b34fb");
+        pub const UNKNOWN:              Uuid = uuid!("0000fed2-0000-1000-8000-00805f9b34fb");
+        pub const UNKNOWN:              Uuid = uuid!("0000fed3-0000-1000-8000-00805f9b34fb");
     */
 }
 
@@ -54,148 +58,246 @@ pub mod notifications {
     pub const ALARM:             &[u8] = &[0x23];
     pub const LE_PARAMS_SUCCESS: &[u8] = &[0x8];
 
-    pub const AUTH_AWAITING:     &[u8] = &[0x13];
-    pub const AUTH_CONFIRMED:    &[u8] = &[0x0a];
-    pub const AUTH_FAILED:       &[u8] = &[0x6];
-    pub const AUTH_SUCCESS:      &[u8] = &[0x5];
-    pub const AUTH_TIMEOUT:      &[u8] = &[0x9];
-}
-
-mod command {
-    #[derive(derive_more::Deref)]
-    pub struct Command([u8; 1]);
-
-    impl From<Command> for u8 {
-        fn from(command: Command) -> Self {
-            command[0]
-        }
+    pub mod auth {
+        pub const AWAITING:     &[u8] = &[0x13];
+        pub const CONFIRMED:    &[u8] = &[0xA];
+        pub const FAILED:       &[u8] = &[0x6];
+        pub const SUCCESS:      &[u8] = &[0x5];
+        pub const TIMEOUT:      &[u8] = &[0x9];
     }
-
-    pub const ALARM:         Command = Command([0x4]);
-    pub const STEP_GOAL:     Command = Command([0x5]);
-    pub const COLLECT_DATA:  Command = Command([0x6]);
-    pub const FACTORY_RESET: Command = Command([0x9]);
-    pub const SYNC:          Command = Command([0xB]);
-    pub const REBOOT:        Command = Command([0xC]);
-    pub const WEAR_LOCATION: Command = Command([0xF]);
-    pub const SET_STEPS:     Command = Command([0x14]);
 }
 
-pub enum OneS {}
+mod control {
+    pub type Command = u8;
+
+    pub const ALARM:         Command = 0x4;
+    pub const STEP_GOAL:     Command = 0x5;
+    pub const COLLECT_DATA:  Command = 0x6;
+    pub const FACTORY_RESET: Command = 0x9;
+    pub const SYNC:          Command = 0xB;
+    pub const REBOOT:        Command = 0xC;
+    pub const WEAR_LOCATION: Command = 0xF;
+    pub const SET_STEPS:     Command = 0x14;
+}
 
 pub trait Model {}
+
+pub enum OneS {}
 impl Model for OneS {}
 
 #[derive(Deref)]
 pub struct MiBand<M: Model> {
     #[deref]
-    pub device:      Device,
-    user:            User,
-    device_info:     Option<DeviceInfo>,
-    model:           std::marker::PhantomData<M>,
-    characteristics: HashMap<::uuid::Uuid, Characteristic>,
+    device:      Device,
+    user:        User,
+    device_info: Option<DeviceInfo>,
+    model:       std::marker::PhantomData<M>,
+    crc:         Crc<u8>,
+
+    // pub commands: HashMap<String, fn>
+    pub characteristics: HashMap<::uuid::Uuid, Characteristic>,
 }
 
-impl<M: Model> MiBand<M> {
-    pub fn new(device: Device, user: User) -> Self {
-        Self {
-            device,
-            user,
-            device_info:     None,
-            model:           std::marker::PhantomData,
-            characteristics: HashMap::new(),
+impl<M: Model> AlertCapable for MiBand<M> {}
+impl HeartRateCapable for MiBand<OneS> {}
+
+#[async_trait]
+impl BluetoothDevice for MiBand<OneS> {
+    async fn connect(&mut self) -> Result<(), Error> {
+        if !self.is_connected().await? {
+            self.device.connect().await?;
         }
+
+        debug!("1");
+
+        if !self.characteristics.is_empty() {
+            self.characteristics.clear()
+        }
+
+        debug!("2");
+
+        for service in self.services().await? {
+            let characteristics = service.characteristics().await?;
+
+            for c in characteristics.into_iter() {
+                let u = c.uuid().await?;
+                self.characteristics.insert(u, c);
+                debug!("Characteristic Found: {u}");
+            }
+        }
+
+        debug!("3");
+
+        self.set_le_params(&LEParams::low_latency()).await?;
+
+        debug!("4");
+
+        let characteristic = &self.characteristics[&uuid::DATE_TIME];
+        characteristic.read().await?;
+
+        debug!("5");
+
+        self.authenticate().await?;
+
+        debug!("6");
+
+        self.set_datetime(&Utc::now().into()).await?;
+
+        debug!("7");
+
+        let today = Local::today().and_hms_opt(8, 30, 0).unwrap().into();
+
+        self.set_alarm(0, false, &today, false, AlarmFrequency::Everyday).await?;
+        self.set_alarm(1, false, &today, false, AlarmFrequency::Everyday).await?;
+        self.set_alarm(2, false, &today, false, AlarmFrequency::Everyday).await?;
+
+
+        debug!("8");
+
+        Ok(())
     }
 
-    pub async fn name(&self) -> Result<String, Error> {
+    fn characteristic(&self, uuid: ::uuid::Uuid) -> &Characteristic {
+        &self.characteristics[&uuid]
+    }
+
+    fn alert(&self)     -> Option<&(dyn Alert + Sync + Send)>     { Some(self) }
+    fn heartrate(&self) -> Option<&(dyn HeartRate + Sync + Send)> { Some(self) }
+    fn steps(&self)     -> Option<&(dyn Steps + Sync + Send)>     { Some(self) }
+    fn battery(&self)   -> Option<&(dyn Battery + Sync + Send)>   { Some(self) }
+}
+
+impl MiBand<OneS> {
+    pub fn boxed(device: Device) -> Box<dyn BluetoothDevice> {
+        Box::from(Self {
+            device,
+            user:            User::default(),
+            device_info:     None,
+            model:           std::marker::PhantomData::<OneS>,
+            crc:             Crc::<u8>::new(&CRC_8_MAXIM_DOW),
+            characteristics: HashMap::new(),
+        })
+    }
+}
+
+impl<M: Model> MiBand<M> where M: Sync + Send {
+    pub async fn device_name(&self) -> Result<String, Error> {
         let characteristic = &self.characteristics[&uuid::DEVICE_NAME];
         let payload = characteristic.read().await?;
 
         Ok(String::from_utf8_lossy(&payload[3..]).to_string())
     }
 
-    pub async fn connect(&mut self) -> Result<(), Error> {
-        if !self.is_connected().await? {
-            self.device.connect().await?;
-        }
-
-        if !self.characteristics.is_empty() {
-            self.characteristics = HashMap::new();
-        }
-
-        for service in self.services().await? {
-            let characteristics = service.characteristics().await?;
-
-            for c in characteristics.into_iter() {
-                self.characteristics.insert(c.uuid().await?, c);
-            }
-        }
-
-        self.set_le_params(&LEParams::low_latency()).await?;
-
-        Ok(())
+    // Unknown 
+    async fn _device_name(&self) -> Result<(), Error> {
+        self.characteristics[&uuid::DEVICE_NAME]
+            .write_ext(&[0], WITH_RESPONSE)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn set_wear_location(&self, location: WearLocation) -> Result<(), Error> {
         let payload = [
-            command::WEAR_LOCATION.into(),
             match location {
                 WearLocation::Left  => 0,
                 WearLocation::Right => 1,
                 WearLocation::Neck  => 2,
-                _ => panic!("Wear location is not supported {:?}", location)
+                _ => panic!("Wear location {:?} is not supported by the device", location)
             }
         ];
 
-        self.control(payload).await
+        self.control_payload(control::WEAR_LOCATION, payload).await
     }
 
-    pub async fn set_alarm(&self, id: u8, enabled: bool, dt: &DateTime, smart: bool, repeat: u8) -> Result<(), Error> {
-        let mut payload = [0; 11];
-        payload[0] = command::ALARM.into();
-        payload[1] = id;
-        payload[2] = enabled as u8;
-        payload[3..9].copy_from_slice(&<[u8; 6]>::from(dt));
-        payload[9] = smart as u8;
-        payload[10] = repeat;
+    async fn set_steps(&self, steps: u32) -> Result<(), Error> {
+        self.control_payload(control::SET_STEPS, steps.to_le_bytes()).await
+    }
+
+    pub async fn set_alarm(&self, id: u8, enabled: bool, dt: &DateTime, smart: bool, frequency: AlarmFrequency) -> Result<(), Error> {
+        let mut payload = [0; 10];
+        payload[0] = id;
+        payload[1] = enabled as u8;
+        payload[2..8].copy_from_slice(&datetime_as_bytes(dt));
+        payload[8] = smart as u8;
+        payload[9] = frequency.as_bits();
         
-        self.control(payload).await
+        self.control_payload(control::ALARM, payload).await
     }
 
-    pub async fn authenticate(&mut self, new: bool) -> Result<(), Error> {
+    pub async fn set_step_goal(&self, steps: u16) -> Result<(), Error> {
+        let mut payload = [0; 3];
+        payload[1..3].copy_from_slice(&steps.to_le_bytes());
+
+        self.control_payload(control::STEP_GOAL, payload).await
+    }
+
+    pub async fn authenticate(&mut self) -> Result<(), Error> {
+        let notifications = self.notify().await?;
+        pin_mut!(notifications);
+
         self.device_info = Some(self.device_info().await?);
-        self.set_user(new).await
+        self.set_user(false).await?;
+
+        loop {
+            use notifications::auth::*;
+            match notifications.next().await.as_deref() {
+                Some(CONFIRMED) => { debug!("Authentication: Confirmed ✓");  break Ok(()) },
+                Some(SUCCESS)   => { debug!("Authentication: Successful ✓"); break Ok(()) },
+                Some(AWAITING)  => { debug!("Authentication: Awaiting confirmation...");  },
+                Some(FAILED)    => { debug!("Authentication: Failed ✗");  },
+                Some(TIMEOUT)   => { debug!("Authentication: Timeout "); },
+                _ => continue,
+            }
+        }
     }
 
-    pub async fn notify_battery(&self) -> Result<impl Stream<Item = BatteryInfo>, Error> {
-        let characteristic = &self.characteristics[&uuid::BATTERY_INFO];
+    // async fn initialization<M: Model>(miband: &MiBand<M>) -> Result<(), Error> where M: Sync + Send {
+        // miband.set_datetime(&Utc::now().into()).await?;
+        // miband.device_info().await?;
+        // miband.battery().await?;
 
-        characteristic 
-            .notify() // impl Stream<Item = Vec<u8>>
-            .await
-            .map_err(|e| e.into())
-            .map(|stream|
-                 stream.filter_map(|payload| async move {
-                     BatteryInfo::try_from(payload.as_slice()).ok()
-                 }))
-    }
+        // let battery_stream = miband.notify_battery().await?;
+        // pin_mut!(battery_stream);
+
+        // miband.steps().await?;
+
+        // miband.le_params().await?;
+        // miband.steps().await?;
+
+        // let steps_stream = miband.notify_steps().await?;
+        // pin_mut!(steps_stream);
+
+        // miband.set_steps(0).await?;
+
+        // miband.set_alarm(0, false, &Local::today().and_hms(22, 18, 0).into(), false, EVERYDAY).await?;
+        // miband.set_alarm(1, false, &Local::today().and_hms(8, 30, 0).into(), true, EVERYDAY).await?;
+        // miband.set_alarm(2, false, &Local::today().and_hms(8, 30, 0).into(), true, EVERYDAY).await?;
+
+        // miband.device_info().await?;
+
+        // miband.name_unknown().await?;
+
+        // miband.set_wear_location(WearLocation::Left).await?;
+
+        // // let delay = Duration::from_secs(5);
+        // // let timer = tokio::time::sleep(delay);
+        // // tokio::pin!(timer);
+
+        // Ok(())
+    // }
 
     pub async fn notify_characteristics(&self) -> Result<impl Stream<Item = Vec<u8>>, Error> {
-        let characteristic = &self.characteristics[&uuid::ACTIVITY];
-
-        characteristic
+        self.characteristics[&uuid::ACTIVITY]
             .notify()
             .await
-            .map_err(|e| e.into())
+            .map_err(Into::into)
     }
 
     pub async fn notify(&self) -> Result<impl Stream<Item = Vec<u8>>, Error> {
-        let characteristic = &self.characteristics[&uuid::NOTIFICATIONS];
-
-        characteristic
+        self.characteristics[&uuid::NOTIFICATIONS]
             .notify()
             .await
-            .map_err(|e| e.into())
+            .map_err(Into::into)
     }
 
     pub async fn device_info(&self) -> Result<DeviceInfo, Error> {
@@ -217,65 +319,38 @@ impl<M: Model> MiBand<M> {
         payload[8] = auth as u8;
         payload[9] = device_info.feature;
         payload[10] = device_info.appearance;
-        payload[19] = (CRC.checksum(&payload[..19]) ^ ADDRESS.last().unwrap()) as u8;
+        payload[19] = self.crc.checksum(&payload[..19]) ^ ADDRESS.last().unwrap();
 
         characteristic.write_ext(&payload, WITH_RESPONSE).await?;
 
         Ok(())
     }
 
+    pub async fn datetime(&self) -> Result<DateTime, Error> {
+        let characteristic = &self.characteristics[&uuid::DATE_TIME];
+        let payload = characteristic.read().await?;
+
+        ensure_length!(payload, 6,
+           Utc.with_ymd_and_hms(
+                   payload[0] as i32 + 2000,
+                   payload[1] as u32,
+                   payload[2] as u32,
+                   payload[3] as u32,
+                   payload[4] as u32,
+                   payload[5] as u32).unwrap().into())
+    }
+
     pub async fn set_datetime(&self, dt: &DateTime) -> Result<(), Error> {
         let characteristic = &self.characteristics[&uuid::DATE_TIME];
 
         let mut payload = [0xFF; 12];
-        payload[0..6].copy_from_slice(&<[u8; 6]>::from(dt));
+
+        payload[0..6].copy_from_slice(&datetime_as_bytes(dt));
 
         characteristic
             .write_ext(&payload, WITH_RESPONSE)
             .await
-            .map_err(|e| e.into())
-    }
-
-    pub async fn battery(&self) -> Result<BatteryInfo, Error> {
-        let characteristic = &self.characteristics[&uuid::BATTERY_INFO];
-
-        let payload = characteristic.read().await?;
-
-        BatteryInfo::try_from(payload.as_slice())
-    }
-
-    pub async fn set_steps(&self, steps: u32) -> Result<(), Error> {
-        let mut payload = [0; 5];
-        payload[0] = command::SET_STEPS.into();
-        payload[1..5].copy_from_slice(&steps.to_le_bytes());
-
-        self.control(payload).await
-    }
-
-    pub async fn steps(&self) -> Result<u32, Error> {
-        let characteristic = &self.characteristics[&uuid::STEPS];
-        let payload = characteristic.read().await?;
-
-        payload.
-            try_into()
-            .map(u32::from_le_bytes)
-            .map_err(|v| Error::Length { expected: 4, actual: v.len() })
-    }
-
-    pub async fn notify_steps(&self) -> Result<impl Stream<Item = u32>, Error> {
-        let characteristic = &self.characteristics[&uuid::STEPS];
-
-        characteristic 
-            .notify() // impl Stream<Item = Vec<u8>>
-            .await
-            .map_err(|e| e.into())
-            .map(|stream|
-                 stream.filter_map(|payload| async {
-                     payload
-                         .try_into()
-                         .map(u32::from_le_bytes)
-                         .ok()
-                 }))
+            .map_err(Into::into)
     }
 
     pub async fn le_params(&self) -> Result<LEParams, Error> {
@@ -286,143 +361,135 @@ impl<M: Model> MiBand<M> {
     }
 
     pub async fn set_le_params(&self, params: &LEParams) -> Result<(), Error> {
-        let characteristic = &self.characteristics[&uuid::LE_PARAMS];
-        characteristic
-            .write_ext(&params.to_le_bytes(), WITH_RESPONSE)
+        self.characteristics[&uuid::LE_PARAMS]
+            .write_ext(params.to_le_bytes(), WITH_RESPONSE)
             .await
-            .map_err(|e| e.into())
+            .map_err(Into::into)
     }
 
     pub async fn factory_reset(&self) -> Result<(), Error> {
-        self.control(*command::FACTORY_RESET).await
+        self.control(control::FACTORY_RESET).await
     }
 
     pub async fn reboot(&self) -> Result<(), Error> {
-        self.control(*command::REBOOT).await
+        self.control(control::REBOOT).await
     }
 
-    async fn control<const N: usize>(&self, payload: [u8; N]) -> Result<(), Error> {
-        let characteristic = &self.characteristics[&uuid::CONTROL];
-        characteristic
+    async fn control(&self, command: control::Command) -> Result<(), Error> {
+        self.characteristics[&uuid::CONTROL]
+            .write_ext(&command.to_le_bytes(), WITH_RESPONSE)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn control_payload<const N: usize>(&self, command: control::Command, data: [u8; N]) -> Result<(), Error> {
+
+        /* Nightly Only                                  */
+        /* https://github.com/rust-lang/rust/issues/76560 */
+        /* let payload = [u8; N + 1];                     */
+
+        let mut payload = vec![0; N + 1];
+        payload[0] = command;
+        payload[1..].copy_from_slice(&data);
+
+        self.characteristics[&uuid::CONTROL]
             .write_ext(&payload, WITH_RESPONSE)
             .await
-            .map_err(|e| e.into())
-    }
-
-    /*  Nightly Only 
-        https://github.com/rust-lang/rust/issues/76560
-        
-        #![feature(generic_const_exprs)]
-        async fn control<const N: usize>(&self, command: command::Command, data: [u8; N]) -> Result<(), Error> {
-            let payload = [u8; N + 1];
-            payload[0] = command.into()
-            payload[1..].copy_from_slice(&data)
-        
-            let characteristic = &self.characteristics[&uuid::CONTROL];
-            characteristic.write(&payload).await
-        }
-    */
-}
-
-#[async_trait]
-impl<M: Model> Alert for MiBand<M> where Self: Sync + Send {
-    async fn alert(&self, level: AlertLevel) -> Result<(), Error> {
-        let characteristic = &self.characteristics[&ALERT_LEVEL];
-
-        let payload = match level {
-            AlertLevel::Mild => [1],
-            AlertLevel::High => [2],
-        };
-
-        characteristic
-            .write(&payload)
-            .await
-            .map_err(|e| e.into())
+            .map_err(Into::into)
     }
 }
 
+fn datetime_as_bytes(dt: &DateTime) -> [u8; 6] {
+    [
+        (dt.year() - 2000) as u8,
+        dt.month() as u8,
+        dt.day() as u8,
+        dt.hour() as u8,
+        dt.minute() as u8,
+        dt.second() as u8,
+    ]
+}
+
 #[async_trait]
-impl HeartRate for MiBand<OneS> where Self: Sync + Send {
-    async fn notify_heartrate(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<u8>>>>, Error> {
-        let characteristic = &self.characteristics[&HEART_RATE_MEASUREMENT];
-        characteristic
+impl<M: Model> Battery for MiBand<M> where Self: Sync + Send {
+    async fn battery_stream(&self) -> Result<Pin<Box<dyn Stream<Item = BatteryInfo> + Send>>, Error> {
+        self.characteristics[&uuid::BATTERY_INFO] 
             .notify()
             .await
+            .map_err(Into::into)
+            .map(|stream| stream.map(|payload| {
+                     BatteryInfo::try_from(payload.as_slice()).expect("parsing battery info")
+                 }))
             .map(|stream| Box::pin(stream) as _)
-            .map_err(|e| e.into())
     }
 
-    async fn set_heartrate_sleep(&self, enable: bool) -> Result<(), Error> {
-        let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
+    async fn battery(&self) -> Result<BatteryInfo, Error> {
+        let characteristic = &self.characteristics[&uuid::BATTERY_INFO];
 
-        let mut payload = Self::SLEEP;
-        payload[2] = enable as u8;
+        let payload = characteristic.read().await?;
 
-        characteristic
-            .write_ext(&payload, WITH_RESPONSE)
-            .await?;
-
-        characteristic // Unknown
-            .write_ext(&[0x14, 0x0], WITH_RESPONSE)
-            .await
-            .map_err(|e| e.into())
-    }
-
-    async fn heartrate_continuous(&self, enable: bool) -> Result<(), Error> {
-        let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
-
-        let mut payload = Self::CONTINUOUS;
-        payload[2] = enable as u8;
-
-        characteristic
-            .write_ext(&payload, WITH_RESPONSE)
-            .await
-            .map_err(|e| e.into())
-    }
-
-    async fn heartrate(&self) -> Result<(), Error> {
-        let characteristic = &self.characteristics[&HEART_RATE_CONTROL_POINT];
-
-        characteristic
-            .write_ext(&Self::MANUAL, WITH_RESPONSE)
-            .await
-            .map_err(|e| e.into())
+        BatteryInfo::try_from(payload.as_slice())
     }
 }
 
-pub struct User {
-    pub id:     u32,
-    pub sex:    Sex,
-    pub age:    u8,
-    pub height: u8, // cm
-    pub weight: u8, // kg
-    pub alias:  String,
+#[async_trait]
+impl<M: Model> Steps for MiBand<M> where Self: Sync + Send {
+    async fn steps(&self) -> Result<u32, Error> {
+        let characteristic = &self.characteristics[&uuid::STEPS];
+        let payload = characteristic.read().await?;
+
+        payload
+            .try_into()
+            .map(u32::from_le_bytes)
+            .map_err(Error::vec_len::<u32>)
+    }
+
+    async fn set_steps(&self, steps: u32) -> Result<(), Error> {
+        unimplemented!()
+        // self.control_payload(control::SET_STEPS, steps.to_le_bytes()).await
+    }
+
+    async fn notify_steps(&self) -> Result<Pin<Box<dyn Stream<Item = u32> + Send>>, Error> {
+        self.characteristics[&uuid::STEPS] 
+            .notify()
+            .await
+            .map_err(Into::into)
+            .map(|stream| stream.map(|payload| {
+                     payload.try_into().map(u32::from_le_bytes).expect("parsing steps")
+                 }))
+            .map(|stream| Box::pin(stream) as _)
+    }
+}
+
+struct User {
+    id:    u32,
+    alias: String,
+    bio:   Bio,
 }
 
 impl Default for User {
     fn default() -> Self {
         Self {
-            id:     141279967,
-            sex:    Sex::Male,
-            age:    14,
-            height: 162,
-            weight: 54,
-            alias:  "Morty".to_owned(),
+            id:    141279967,
+            alias: "Morty".to_owned(),
+            bio:   Bio::default(),
         }
     }
 }
 
 impl User {
+    const MAX_ALIAS_LENGTH: usize = 8;
+
     fn to_bytes(&self) -> [u8; 20] {
         let mut b = [0u8; 20];
 
         b[0..4].copy_from_slice(&self.id.to_le_bytes());
-        b[4] = self.sex.into();
-        b[5] = self.age;
-        b[6] = self.height;
-        b[7] = self.weight;
+        b[4] = self.bio.sex.into();
+        b[5] = self.bio.age;
+        b[6] = self.bio.height;
+        b[7] = self.bio.weight;
 
-        let i = std::cmp::min(self.alias.len(), 8);
+        let i = std::cmp::min(self.alias.len(), Self::MAX_ALIAS_LENGTH);
         b[11..11+i].copy_from_slice(&self.alias.as_bytes()[..i]);
 
         b
@@ -445,7 +512,7 @@ impl From<Sex> for u8 {
     fn from(sex: Sex) -> Self {
         match sex {
             Sex::Female => 0,
-            Sex::Male => 1,
+            Sex::Male   => 1,
         }
     }
 }
@@ -464,18 +531,15 @@ impl TryFrom<&[u8]> for DeviceInfo {
     type Error = Error;
 
     fn try_from(b: &[u8]) -> Result<Self, Self::Error> {
-        if b.len() == 20 {
-            Ok(DeviceInfo {
+        ensure_length!(b, 20, 
+            DeviceInfo {
                 id:                     u32::from_be_bytes(b[0..4].try_into().unwrap()),
                 feature:                b[4],
                 appearance:             b[5],
                 hardware_version:       b[6],
                 profile_version:        Version(b[8..12].try_into().unwrap()),
                 firmware_version:       Version(b[12..16].try_into().unwrap()),
-                firmware_version_heart: Version(b[16..20].try_into().unwrap()),
-            })
-        }
-        else { Err(Error::Length { expected: 20, actual: b.len() }) }
+                firmware_version_heart: Version(b[16..20].try_into().unwrap()) })
     }
 }
 
@@ -485,38 +549,20 @@ impl fmt::Display for Version {
     }
 }
 
-#[derive(Debug)]
-pub struct BatteryInfo {
-    pub level:       u8,
-    pub datetime:    DateTime,
-    pub charges:     u16,
-    pub status:      BatteryStatus,
-}
-
 impl TryFrom<&[u8]> for BatteryInfo {
     type Error = Error;
 
-    fn try_from(b: &[u8]) -> Result<Self, Self::Error> {
-        if b.len() == 10 {
-            Ok(
-                BatteryInfo {
-                level:    b[0],
-                datetime: DateTime::from(<[u8; 6]>::try_from(&b[1..7]).unwrap()),
-                charges:  u16::from_le_bytes(b[7..9].try_into().unwrap()),
-                status:   BatteryStatus::try_from(b[9])?,
-            })
-        } else {
-            Err(Error::Length { expected: 10, actual: b.len() })
-        }
-    }
-}
+    // level:    u8,
+    // datetime: [u8; 6],
+    // charges:  u16,
+    // status:   u8,
 
-#[derive(Debug)]
-pub enum BatteryStatus {
-    Low,
-    Charging,
-    NotCharging,
-    Full,
+    fn try_from(b: &[u8]) -> Result<Self, Self::Error> {
+        ensure_length!(b, 10,
+                Self {
+                level:    b[0],
+                status:   BatteryStatus::try_from(b[9]).ok() })
+    }
 }
 
 impl TryFrom<u8> for BatteryStatus {
@@ -533,6 +579,7 @@ impl TryFrom<u8> for BatteryStatus {
     }
 }
 
+#[repr(C)]
 pub struct LEParams {
     min_interval:           u16,
     max_interval:           u16,
@@ -556,23 +603,16 @@ impl Default for LEParams {
 }
 
 impl LEParams {
-    fn to_le_bytes(&self) -> [u8; 12] {
-        let mut b = [0u8; 12];
+    fn to_le_bytes(&self) -> &[u8] {
+        assert_eq!(mem::size_of::<Self>(), 12);
 
-        b[0..2].copy_from_slice(&self.min_interval.to_le_bytes());
-        b[2..4].copy_from_slice(&self.max_interval.to_le_bytes());
-        b[4..6].copy_from_slice(&self.latency.to_le_bytes());
-        b[6..8].copy_from_slice(&self.timeout.to_le_bytes());
-        b[8..10].copy_from_slice(&self.connection_interval.to_le_bytes());
-        b[10..12].copy_from_slice(&self.advertisement_interval.to_le_bytes());
-
-        b
+        unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, mem::size_of::<Self>()) }
     }
 
     fn low_latency() -> Self {
         LEParams {
-            min_interval:           36,
-            max_interval:           36,
+            min_interval: 36,
+            max_interval: 36,
             ..LEParams::default()
         }
     }
@@ -582,43 +622,8 @@ impl TryFrom<&[u8]> for LEParams {
     type Error = Error;
 
     fn try_from(b: &[u8]) -> Result<Self, Self::Error> {
-        if b.len() == 12 {
-            Ok(LEParams {
-                min_interval:           u16::from_le_bytes(b[0..2].try_into().unwrap()),
-                max_interval:           u16::from_le_bytes(b[2..4].try_into().unwrap()),
-                latency:                u16::from_le_bytes(b[4..6].try_into().unwrap()),
-                timeout:                u16::from_le_bytes(b[6..8].try_into().unwrap()),
-                connection_interval:    u16::from_le_bytes(b[8..10].try_into().unwrap()),
-                advertisement_interval: u16::from_le_bytes(b[10..12].try_into().unwrap()),
-            })
-        } else {
-            Err(Error::Length { expected: 12, actual: b.len() })
-        }
-    }
-}
-
-impl From<[u8; 6]> for DateTime {
-    fn from(b: [u8; 6]) -> Self {
-        Self(Utc.ymd(
-                b[0] as i32 + 2000,
-                b[1] as u32,
-                b[2] as u32)
-            .and_hms(
-                b[3] as u32,
-                b[4] as u32,
-                b[5] as u32))
-    }
-}
-
-impl From<&DateTime> for [u8; 6] {
-    fn from(dt: &DateTime) -> Self {
-        [
-            (dt.year() - 2000) as u8,
-            dt.month() as u8,
-            dt.day() as u8,
-            dt.hour() as u8,
-            dt.minute() as u8,
-            dt.second() as u8,
-        ]
+        ensure_length!(b, mem::size_of::<Self>(),
+            unsafe { mem::transmute_copy::<[u8; mem::size_of::<Self>()], Self>(&*(b as *const _ as *const _)) }
+        )
     }
 }
